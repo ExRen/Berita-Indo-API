@@ -1,0 +1,10 @@
+# Dependencies untuk Vercel Serverless Python
+# Vercel membaca file ini secara otomatis dan menginstall saat build.
+# Pastikan tidak ada package yang memerlukan binary system-level (seperti lxml versi lama)
+# karena environment Vercel adalah Linux minimal tanpa compiler.
+
+fastapi==0.115.0          # Framework API — kompatibel penuh dengan ASGI Vercel
+httpx==0.27.0             # HTTP client untuk fetch RSS feed
+feedparser==6.0.11        # Parser XML/RSS yang murni Python, aman untuk Vercel
+rapidfuzz==3.9.0          # Fuzzy matching untuk pencarian keyword
+cachetools==5.4.0         # TTLCache — efektif untuk warm instance di Vercel
