@@ -1,22 +1,21 @@
 """
 api/index.py — Entry point utama untuk Vercel Serverless
 ==========================================================
-Di Vercel, Python ASGI app harus ada di folder `api/` dan
-file ini (index.py) akan dipanggil untuk SEMUA request berkat
-routing di vercel.json: { "source": "/(.*)", "destination": "/api/index" }
+PERBAIKAN v2.1:
+- Urutan route diperbaiki: /v1/search/all dipindahkan ke ATAS /v1/{source}
+  Ini adalah root cause dari error 404 sebelumnya. FastAPI memproses route
+  secara berurutan dari atas ke bawah dan berhenti di kecocokan pertama.
+  Jika /v1/{source} ditulis lebih dulu, request ke /v1/search/all akan
+  dicocokkan sebagai source="search" (yang tidak ada di SOURCES) → 404.
+- vercel.json dikembalikan ke "rewrites" (bukan "builds"+"routes")
 
-Catatan penting tentang caching di Vercel Serverless:
-------------------------------------------------------
-Vercel menjalankan setiap fungsi dalam container yang bisa
-"dingin" (cold) atau "hangat" (warm). Saat container hangat,
-variabel modul (termasuk _cache) tetap hidup di memori dan
-TTLCache berfungsi dengan baik. Saat container dingin (baru
-dibangunkan setelah idle), cache kosong dan RSS di-fetch ulang.
-Ini adalah trade-off yang wajar untuk serverless — tidak ada
-solusi sempurna tanpa database eksternal seperti Redis/Upstash.
-Untuk MedMon, ini sudah sangat cukup karena request berita
-biasanya datang dalam burst (banyak dalam waktu singkat),
-sehingga container akan tetap hangat selama sesi scraping.
+Urutan route yang benar:
+  1. GET /                    ← info root
+  2. GET /health              ← health check
+  3. GET /v1/sources/list     ← SPESIFIK: harus sebelum wildcard
+  4. GET /v1/search/all       ← SPESIFIK: harus sebelum /v1/{source} ← KUNCI PERBAIKAN
+  5. GET /v1/{source}         ← WILDCARD: menangkap source manapun
+  6. GET /v1/{source}/{category} ← WILDCARD dua segmen
 """
 
 import re
@@ -32,30 +31,23 @@ from rapidfuzz import fuzz
 
 from feeds_config import SOURCES, get_feed_url, get_all_categories
 
-# ─── Cache Setup ─────────────────────────────────────────────────────────────
-# maxsize=300 : simpan maks 300 pasangan source+category sekaligus
-# ttl=300     : data kedaluwarsa setelah 5 menit
-# Lock diperlukan karena Vercel bisa menjalankan beberapa request
-# secara concurrent dalam satu instance yang sama.
+# ─── Cache Setup ──────────────────────────────────────────────────────────────
 _cache: TTLCache = TTLCache(maxsize=300, ttl=300)
 _cache_lock = threading.Lock()
 
-# ─── Inisialisasi FastAPI ─────────────────────────────────────────────────────
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Berita Indonesia API",
     description=(
         "Self-hosted REST API berita Indonesia berbasis RSS feed. "
-        "Mendukung 13 media besar dengan pencarian fuzzy keyword. "
-        "Dapat diintegrasikan langsung ke MedMon sebagai sumber berita tambahan.\n\n"
+        "Mendukung 14 media besar dengan pencarian fuzzy keyword.\n\n"
         "**Sumber:** CNN ID · CNBC ID · Detik · Kompas · Tempo · Antara · "
         "Republika · OkeZone · Tribun · Bisnis ID · Sindonews · Merdeka · "
         "Kumparan · Suara"
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
-# Izinkan akses dari mana saja — wajib agar MedMon (yang mungkin
-# berjalan di domain lain) bisa memanggil API ini tanpa error CORS.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,15 +57,11 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HELPER: Parsing dan Normalisasi Data RSS
+#  HELPER: Parsing dan Normalisasi RSS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clean_html(text: str) -> str:
-    """
-    Hapus semua tag HTML dari string.
-    RSS feed sering menyertakan HTML di dalam field description,
-    misalnya <p>teks artikel</p> atau <img src="..."/>.
-    """
+    """Hapus semua tag HTML dari string teks."""
     if not text:
         return ""
     return re.sub(r"<[^>]+>", "", text).strip()
@@ -82,25 +70,20 @@ def _clean_html(text: str) -> str:
 def _extract_image(entry: dict) -> str | None:
     """
     Coba ambil URL gambar dari berbagai kemungkinan field RSS.
-    Setiap media menyimpan gambar di field yang berbeda-beda,
-    sehingga kita perlu cek beberapa tempat secara berurutan.
+    Urutan pengecekan dari yang paling umum ke yang paling jarang.
     """
-    # media:content — digunakan oleh CNN, Detik, dan banyak media besar
     for item in entry.get("media_content", []):
         if item.get("url"):
             return item["url"]
 
-    # enclosures — format attachment RSS standar
     for enc in entry.get("enclosures", []):
         if enc.get("type", "").startswith("image"):
             return enc.get("url")
 
-    # media:thumbnail — digunakan oleh beberapa feed Google-powered
     for thumb in entry.get("media_thumbnail", []):
         if thumb.get("url"):
             return thumb["url"]
 
-    # Terakhir, coba ekstrak <img src="..."> dari dalam HTML description
     raw = entry.get("summary", "") or entry.get("description", "")
     match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', raw)
     return match.group(1) if match else None
@@ -109,12 +92,11 @@ def _extract_image(entry: dict) -> str | None:
 def _normalize(entry: dict, source_name: str, category: str) -> dict:
     """
     Konversi satu entry feedparser ke format JSON yang seragam.
-    Format yang konsisten ini sangat penting agar MedMon tidak perlu
-    menulis logika parsing berbeda untuk tiap media.
+    Format konsisten ini penting agar MedMon tidak perlu logika
+    parsing berbeda untuk tiap media.
     """
     title = _clean_html(entry.get("title", ""))
 
-    # Ambil deskripsi singkat dari berbagai kemungkinan field
     raw_summary = (
         entry.get("summary")
         or entry.get("description")
@@ -122,8 +104,8 @@ def _normalize(entry: dict, source_name: str, category: str) -> dict:
     )
     snippet = _clean_html(raw_summary)[:300]
 
-    # Normalisasi tanggal: feedparser menyediakan published_parsed
-    # sebagai struct_time Python yang lebih mudah diformat.
+    # feedparser menyediakan published_parsed sebagai struct_time Python
+    # yang lebih mudah diformat daripada string mentah.
     pub_date = ""
     if entry.get("published_parsed"):
         try:
@@ -132,7 +114,6 @@ def _normalize(entry: dict, source_name: str, category: str) -> dict:
             )
         except Exception:
             pass
-    # Fallback ke string mentah jika struct_time tidak tersedia
     if not pub_date:
         pub_date = entry.get("published", entry.get("updated", ""))
 
@@ -154,18 +135,8 @@ def _normalize(entry: dict, source_name: str, category: str) -> dict:
 def fetch_feed(source_key: str, category: str) -> list[dict]:
     """
     Ambil dan parse RSS feed untuk satu pasangan source+category.
-
-    Alur kerjanya:
-    1. Cek cache — jika ada dan belum kedaluwarsa, langsung return
-    2. Jika tidak ada di cache, fetch RSS via httpx
-    3. Parse XML dengan feedparser
-    4. Normalisasi setiap entry ke format seragam
-    5. Simpan ke cache sebelum return
-
-    Kenapa pakai httpx bukan langsung feedparser.parse(url)?
-    Karena feedparser.parse(url) tidak bisa set custom User-Agent,
-    dan beberapa media Indonesia memblokir request tanpa User-Agent
-    yang terlihat seperti browser nyata.
+    Hasil disimpan di TTLCache selama 5 menit untuk mengurangi
+    beban ke server media dan mempercepat response.
     """
     cache_key = f"{source_key}:{category}"
 
@@ -177,14 +148,16 @@ def fetch_feed(source_key: str, category: str) -> list[dict]:
     if not feed_url:
         raise HTTPException(
             status_code=404,
-            detail=f"Source '{source_key}' dengan kategori '{category}' tidak ditemukan.",
+            detail=(
+                f"Kategori '{category}' tidak ditemukan untuk source '{source_key}'. "
+                f"Kategori tersedia: {get_all_categories(source_key)}"
+            ),
         )
 
     source_name = SOURCES[source_key]["name"]
 
     try:
         headers = {
-            # User-Agent yang terlihat seperti browser biasa
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -192,14 +165,14 @@ def fetch_feed(source_key: str, category: str) -> list[dict]:
             ),
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         }
-        # timeout=(5, 20): 5 detik untuk connect, 20 detik untuk baca data
-        # Ini penting di Vercel karena fungsi serverless punya batas waktu eksekusi.
-        resp = httpx.get(feed_url, headers=headers, timeout=(5, 20), follow_redirects=True)
+        resp = httpx.get(
+            feed_url, headers=headers, timeout=(5, 20), follow_redirects=True
+        )
         resp.raise_for_status()
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=504,
-            detail=f"Timeout saat mengambil feed '{source_key}/{category}'. Coba lagi.",
+            detail=f"Timeout saat mengambil feed '{source_key}/{category}'.",
         )
     except httpx.HTTPStatusError as e:
         raise HTTPException(
@@ -209,13 +182,11 @@ def fetch_feed(source_key: str, category: str) -> list[dict]:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gagal fetch feed: {str(e)}")
 
-    # Parse konten XML yang sudah di-fetch
     feed = feedparser.parse(resp.text)
-
     articles = [
         _normalize(entry, source_name, category)
         for entry in feed.entries
-        if entry.get("link")  # Abaikan entry tanpa URL — tidak bisa dipakai
+        if entry.get("link")
     ]
 
     with _cache_lock:
@@ -230,18 +201,9 @@ def fetch_feed(source_key: str, category: str) -> list[dict]:
 
 def fuzzy_filter(articles: list[dict], query: str, threshold: int = 70) -> list[dict]:
     """
-    Filter daftar artikel berdasarkan query menggunakan fuzzy matching.
-
-    Mengapa fuzzy dan bukan exact match biasa?
-    Karena pengguna mungkin ketik "asabri" sementara judul artikel
-    menyebutnya "PT ASABRI (Persero)" atau "Asabri Tbk". Exact match
-    akan melewatkan semua variasi itu. Dengan partial_ratio dari
-    rapidfuzz, kita mencari apakah query ada sebagai substring fuzzy
-    di dalam teks yang lebih panjang.
-
-    threshold=70: nilai 0-100. 70 adalah keseimbangan yang baik
-    antara "tidak terlalu ketat" dan "tidak terlalu longgar".
-    Naikkan ke 85-90 untuk pencarian yang lebih presisi.
+    Filter artikel berdasarkan query dengan tiga strategi bertingkat:
+    exact match (skor 100) → fuzzy partial_ratio (skor threshold+).
+    Hasil diurutkan dari skor tertinggi ke terendah.
     """
     if not query:
         return articles
@@ -250,34 +212,29 @@ def fuzzy_filter(articles: list[dict], query: str, threshold: int = 70) -> list[
     scored = []
 
     for art in articles:
-        # Gabungkan judul + snippet sebagai teks yang dicari
         text = f"{art.get('title', '')} {art.get('contentSnippet', '')}".lower()
 
-        # Exact match selalu menang dengan skor 100
+        # Exact match selalu prioritas tertinggi
         if q in text:
             scored.append((art, 100))
             continue
 
-        # Fuzzy match sebagai jaring pengaman
         score = fuzz.partial_ratio(q, text)
         if score >= threshold:
             scored.append((art, score))
 
-    # Urutkan dari skor tertinggi ke terendah
     scored.sort(key=lambda x: x[1], reverse=True)
     return [art for art, _ in scored]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ENDPOINTS
+#  ENDPOINTS — PERHATIKAN URUTANNYA, INI KUNCI DARI PERBAIKAN
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── 1. Root info ──────────────────────────────────────────────────────────────
 @app.get("/", tags=["Info"])
 def root():
-    """
-    Halaman info utama. Bisa digunakan sebagai health check — jika
-    endpoint ini merespons, berarti API berjalan dengan baik.
-    """
+    """Info API dan daftar semua source. Berguna sebagai health check dasar."""
     sources_info = {
         key: {
             "name": cfg["name"],
@@ -289,16 +246,17 @@ def root():
     return {
         "status": "ok",
         "message": "Berita Indonesia API — Vercel Edition",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "docs": "/docs",
         "total_sources": len(SOURCES),
         "sources": sources_info,
     }
 
 
+# ── 2. Health check ───────────────────────────────────────────────────────────
 @app.get("/health", tags=["Info"])
 def health():
-    """Health check ringan untuk monitoring uptime."""
+    """Health check ringan — cukup cek apakah server merespons."""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -306,11 +264,14 @@ def health():
     }
 
 
+# ── 3. Daftar sumber ── HARUS sebelum wildcard /v1/{source} ──────────────────
 @app.get("/v1/sources/list", tags=["Info"])
 def list_sources():
     """
-    Daftar lengkap semua sumber berita dan kategori yang tersedia.
-    Berguna sebagai referensi sebelum memanggil endpoint spesifik.
+    Daftar lengkap semua sumber berita beserta kategori yang tersedia.
+    Endpoint ini HARUS didefinisikan sebelum /v1/{source} karena jika tidak,
+    FastAPI akan mencocokkan /v1/sources/list sebagai source="sources"
+    yang tidak ada di SOURCES dict, menghasilkan 404.
     """
     return {
         "status": "ok",
@@ -327,23 +288,97 @@ def list_sources():
     }
 
 
+# ── 4. Pencarian global ── INI YANG PALING KRITIS, HARUS sebelum /v1/{source} ─
+@app.get("/v1/search/all", tags=["Pencarian Global"])
+def search_all(
+    q: str = Query(..., description="Kata kunci pencarian — wajib diisi"),
+    sources: str = Query(
+        default=None,
+        description=(
+            "Sumber yang dicari, pisahkan koma. "
+            "Contoh: cnn,detik,tempo. Kosongkan untuk semua sumber."
+        ),
+    ),
+    limit: int = Query(default=30, ge=1, le=200, description="Total artikel maksimal"),
+    threshold: int = Query(
+        default=70, ge=50, le=100,
+        description="Sensitivitas fuzzy: 50=longgar, 100=exact only"
+    ),
+):
+    """
+    Cari berita dari SEMUA media sekaligus dalam satu request.
+    Ini endpoint paling penting untuk MedMon.
+
+    PENTING — mengapa endpoint ini harus di atas /v1/{source}:
+    FastAPI memproses route dari atas ke bawah dan berhenti di
+    kecocokan pertama. Jika /v1/{source} ada lebih dulu, request ke
+    /v1/search/all akan dicocokkan sebagai source="search" → 404.
+    Dengan meletakkan endpoint spesifik ini di atas route wildcard,
+    FastAPI akan mencocokkannya dengan benar sebelum mencoba wildcard.
+
+    Contoh penggunaan:
+    - /v1/search/all?q=PT+ASABRI
+    - /v1/search/all?q=korupsi&sources=kompas,tempo,antara
+    - /v1/search/all?q=BUMN&limit=50&threshold=80
+    """
+    if sources:
+        source_list = [s.strip().lower() for s in sources.split(",") if s.strip()]
+        invalid = [s for s in source_list if s not in SOURCES]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Source tidak valid: {invalid}. Tersedia: {list(SOURCES.keys())}",
+            )
+    else:
+        source_list = list(SOURCES.keys())
+
+    all_articles: list[dict] = []
+    errors: list[dict] = []
+
+    for key in source_list:
+        default_cat = SOURCES[key].get("default_category", "terbaru")
+        try:
+            articles = fetch_feed(key, default_cat)
+            all_articles.extend(articles)
+        except HTTPException as e:
+            errors.append({"source": key, "error": e.detail})
+        except Exception as e:
+            errors.append({"source": key, "error": str(e)})
+
+    filtered = fuzzy_filter(all_articles, q, threshold=threshold)
+
+    def parse_date(art: dict) -> datetime:
+        try:
+            return datetime.strptime(art.get("pubDate", ""), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime.min
+
+    filtered.sort(key=parse_date, reverse=True)
+
+    result = {
+        "status": "ok",
+        "query": q,
+        "sources_searched": len(source_list),
+        "total": len(filtered[:limit]),
+        "data": filtered[:limit],
+    }
+    if errors:
+        result["warnings"] = errors
+
+    return result
+
+
+# ── 5. Berita per sumber ── Wildcard, tangkap source manapun ─────────────────
 @app.get("/v1/{source}", tags=["Berita per Sumber"])
 def get_by_source(
     source: str,
-    search: str = Query(default=None, description="Kata kunci pencarian fuzzy pada judul"),
+    search: str = Query(default=None, description="Kata kunci pencarian fuzzy"),
     limit: int = Query(default=20, ge=1, le=100, description="Jumlah maksimal artikel"),
     category: str = Query(default=None, description="Nama kategori spesifik"),
 ):
     """
     Ambil berita terbaru dari satu sumber media.
-
-    Jika `category` tidak diisi, akan menggunakan kategori default
-    sumber tersebut (biasanya 'terbaru' atau 'terkini').
-
-    Contoh penggunaan:
-    - `/v1/cnn` → semua berita terbaru CNN Indonesia
-    - `/v1/detik?category=finance&limit=10` → 10 berita finance Detik
-    - `/v1/tempo?search=ASABRI` → berita Tempo tentang ASABRI
+    Contoh: /v1/cnn, /v1/detik?category=finance, /v1/tempo?search=ASABRI
     """
     source = source.lower()
     if source not in SOURCES:
@@ -367,19 +402,17 @@ def get_by_source(
     }
 
 
+# ── 6. Berita per sumber + kategori ── Wildcard dua segmen ───────────────────
 @app.get("/v1/{source}/{category}", tags=["Berita per Kategori"])
 def get_by_category(
     source: str,
     category: str,
-    search: str = Query(default=None, description="Kata kunci pencarian fuzzy pada judul"),
+    search: str = Query(default=None, description="Kata kunci pencarian fuzzy"),
     limit: int = Query(default=20, ge=1, le=100, description="Jumlah maksimal artikel"),
 ):
     """
-    Ambil berita dari kombinasi sumber + kategori yang spesifik.
-
-    Contoh:
-    - `/v1/antara/hukum` → berita hukum dari Antara
-    - `/v1/bisnis/keuangan?search=BUMN&limit=15` → berita keuangan Bisnis ID tentang BUMN
+    Ambil berita dari kombinasi sumber + kategori spesifik.
+    Contoh: /v1/antara/hukum, /v1/bisnis/keuangan?search=BUMN
     """
     source = source.lower()
     category = category.lower()
@@ -401,93 +434,3 @@ def get_by_category(
         "total": len(articles[:limit]),
         "data": articles[:limit],
     }
-
-
-@app.get("/v1/search/all", tags=["Pencarian Global"])
-def search_all(
-    q: str = Query(..., description="Kata kunci pencarian — wajib diisi"),
-    sources: str = Query(
-        default=None,
-        description=(
-            "Sumber yang ingin dicari, pisahkan dengan koma. "
-            "Contoh: cnn,detik,tempo. Kosongkan untuk semua sumber."
-        ),
-    ),
-    limit: int = Query(default=30, ge=1, le=200, description="Total artikel maksimal dari semua sumber"),
-    threshold: int = Query(
-        default=70, ge=50, le=100,
-        description="Sensitivitas fuzzy match: 50=longgar, 100=exact only"
-    ),
-):
-    """
-    Endpoint paling penting untuk MedMon.
-
-    Mencari berita berdasarkan keyword di SEMUA media sekaligus
-    dalam satu request. Hasilnya diurutkan dari yang terbaru.
-
-    Cara kerja di balik layar:
-    1. Semua sumber di-fetch secara sekuensial (batasan serverless)
-    2. Setiap artikel dicek relevansinya dengan fuzzy matching
-    3. Hasil digabungkan dan diurutkan berdasarkan tanggal
-    4. Response dikirim dengan informasi sumber dan total
-
-    Contoh penggunaan:
-    - `/v1/search/all?q=PT+ASABRI` → cari di semua 13 media
-    - `/v1/search/all?q=korupsi&sources=kompas,tempo,antara&limit=50`
-    - `/v1/search/all?q=BUMN&threshold=85` → pencarian lebih ketat
-    """
-    # Tentukan daftar sumber yang akan dicari
-    if sources:
-        source_list = [s.strip().lower() for s in sources.split(",") if s.strip()]
-        invalid = [s for s in source_list if s not in SOURCES]
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Source tidak valid: {invalid}. Tersedia: {list(SOURCES.keys())}",
-            )
-    else:
-        source_list = list(SOURCES.keys())
-
-    all_articles: list[dict] = []
-    errors: list[dict] = []
-
-    # Fetch dari setiap sumber secara berurutan.
-    # Di environment serverless, ThreadPoolExecutor tidak direkomendasikan
-    # karena bisa melebihi batas memory/thread. Fetch sekuensial lebih aman
-    # dan tetap cukup cepat karena cache mengurangi beban network.
-    for key in source_list:
-        default_cat = SOURCES[key].get("default_category", "terbaru")
-        try:
-            articles = fetch_feed(key, default_cat)
-            all_articles.extend(articles)
-        except HTTPException as e:
-            # Satu sumber gagal tidak menghentikan seluruh request
-            errors.append({"source": key, "error": e.detail})
-        except Exception as e:
-            errors.append({"source": key, "error": str(e)})
-
-    # Filter berdasarkan keyword
-    filtered = fuzzy_filter(all_articles, q, threshold=threshold)
-
-    # Urutkan berdasarkan tanggal terbaru
-    def parse_date(art: dict) -> datetime:
-        try:
-            return datetime.strptime(art.get("pubDate", ""), "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return datetime.min
-
-    filtered.sort(key=parse_date, reverse=True)
-
-    result = {
-        "status": "ok",
-        "query": q,
-        "sources_searched": len(source_list),
-        "total": len(filtered[:limit]),
-        "data": filtered[:limit],
-    }
-
-    # Sertakan peringatan jika ada sumber yang gagal, tapi jangan crash
-    if errors:
-        result["warnings"] = errors
-
-    return result
